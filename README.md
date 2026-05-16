@@ -1,156 +1,65 @@
-\# CDPR Thesis Project
+# Cable-Driven Parallel Robot (CDPR)
+> Sistema de posicionamiento XYZ suspendido por cables para monitoreo y localización mediante visión artificial — Tesis UTEC
 
+---
 
+## ¿Qué es este proyecto?
 
-Sistema de posicionamiento XYZ suspendido por cables (Cable-Driven Parallel Robot) para monitoreo y localización mediante visión artificial.
+Un **Cable-Driven Parallel Robot (CDPR)** es un robot paralelo donde los eslabones rígidos son reemplazados por cables. Este proyecto implementa un sistema de posicionamiento 3D que combina control embebido en ESP32 con visión artificial para estimar la posición y orientación del efector final en tiempo real.
 
+---
 
-
-\## Estructura del repositorio
-
-
-
-```text
-
-.
-
-├── control/
-
-└── camara/
+## Estructura del repositorio
 
 ```
+tesis/
+├── control/        # Firmware ESP32 — motores, encoders y cinemática
+└── camara/         # Visión artificial — calibración, AprilTags y pose
+```
 
+---
 
+## Módulos
 
-\---
+### control/
+Firmware embebido para el **ESP32** desarrollado con PlatformIO + ESP-IDF.
 
+| Componente | Descripción |
+|---|---|
+| Motores | Control de velocidad y dirección |
+| Encoders | Lectura de posición angular |
+| Cinemática | Cálculo de longitudes de cable |
+| Trayectoria | Planificación y seguimiento de trayectorias |
+| Comunicación | Interfaz serial con PC |
 
+**Stack:**
+- ESP32 + FreeRTOS
+- ESP-IDF
+- PlatformIO
 
-\# control/
+> La lógica principal vive en `main/`. El sistema corre tareas concurrentes con FreeRTOS.
 
+---
 
+### camara/
+Pipeline de visión artificial para localización del robot.
 
-Código embebido para el ESP32 usando PlatformIO + ESP-IDF.
+| Componente | Descripción |
+|---|---|
+| Calibración | Estimación de parámetros intrínsecos de cámara |
+| AprilTags | Detección de marcadores fiduciales |
+| Pose | Estimación de posición y orientación 6DOF |
+| Scripts | Herramientas de prueba y validación |
 
+**Dependencias:**
+- Python 3.x
+- OpenCV
+- NumPy
+- AprilTag
 
+---
 
-Funciones principales:
+## Autores
 
-\- Control de motores
-
-\- Lectura de encoders
-
-\- Cinemática del sistema
-
-\- Cálculo de longitudes de cables
-
-\- Control de trayectoria
-
-\- Comunicación serial
-
-\- Pruebas de control
-
-
-
-\## Entorno
-
-\- ESP32
-
-\- ESP-IDF
-
-\- PlatformIO
-
-
-
-\## Notas
-
-\- El sistema usa FreeRTOS tasks.
-
-\- La lógica principal está en `main/`.
-
-\- Pendiente: implementar control cerrado con feedback visual.
-
-
-
-\---
-
-
-
-\# camara/
-
-
-
-Código relacionado con visión artificial y localización.
-
-
-
-Funciones principales:
-
-\- Calibración de cámara
-
-\- Detección de AprilTags
-
-\- Estimación de pose
-
-\- Obtención de posición y orientación
-
-\- Scripts de prueba
-
-
-
-\## Librerías
-
-\- OpenCV
-
-\- NumPy
-
-\- AprilTag
-
-
-
-\## Notas
-
-\- La calibración se realiza usando tablero checkerboard.
-
-\- Pendiente: integrar feedback en tiempo real con el controlador.
-
-
-
-\---
-
-
-
-\# Objetivo general
-
-
-
-Desarrollar un sistema CDPR capaz de posicionar una plataforma en coordenadas XYZ usando control cinemático y retroalimentación visual.
-
-
-
-\---
-
-
-
-\# Estado actual
-
-
-
-\- \[x] Cinemática básica
-
-\- \[x] Control de motores
-
-\- \[x] Lectura de encoders
-
-\- \[x] Detección de AprilTags
-
-\- \[x] Calibración de cámara
-
-\- \[ ] Integración completa control + visión
-
-\- \[ ] Corrección de error en tiempo real
-
-\- \[ ] Pruebas finales
-
-
-
+**Gianmarco Humpiri Coila** — UTEC
+**Piero Reyes Velarde** — UTEC
