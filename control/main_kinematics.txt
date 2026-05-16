@@ -1,0 +1,117 @@
+#include <stdio.h>
+#include "EncoderClass.h"
+#include "MotorClass.h"
+#include "PIDClass.h"
+#include "uart_manager.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+
+// === Parámetros generales ===
+const float Ts = 0.02f;  // periodo de muestreo (s)
+
+// === UART I/O ===
+static int16_t inputs[4];   // desde MATLAB → ESP32 (setpoints)
+static int16_t outputs[4];  // desde ESP32 → MATLAB (posiciones)
+
+// === PID (idéntico para todos los motores) ===
+const float Kp = 1.00f;
+const float Ki = 0.00f;
+const float Kd = 0.00f;
+
+// === Objetos globales ===
+// Encoders
+EncoderClass encoder1(GPIO_NUM_15, GPIO_NUM_2, PCNT_UNIT_0);
+EncoderClass encoder2(GPIO_NUM_35, GPIO_NUM_34, PCNT_UNIT_1);
+EncoderClass encoder3(GPIO_NUM_21, GPIO_NUM_22, PCNT_UNIT_2);
+EncoderClass encoder4(GPIO_NUM_18,  GPIO_NUM_19,  PCNT_UNIT_3);
+
+// Motores
+MotorClass Motor1(GPIO_NUM_32, GPIO_NUM_33, MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A);
+MotorClass Motor2(GPIO_NUM_25, GPIO_NUM_26, MCPWM_UNIT_0, MCPWM_TIMER_1, MCPWM_OPR_A);
+MotorClass Motor3(GPIO_NUM_27, GPIO_NUM_14, MCPWM_UNIT_1, MCPWM_TIMER_0, MCPWM_OPR_A);
+MotorClass Motor4(GPIO_NUM_5,  GPIO_NUM_4,  MCPWM_UNIT_1, MCPWM_TIMER_1, MCPWM_OPR_A);
+
+// PID
+PIDClass pid1(Kp, Ki, Kd, Ts);
+PIDClass pid2(Kp, Ki, Kd, Ts);
+PIDClass pid3(Kp, Ki, Kd, Ts);
+PIDClass pid4(Kp, Ki, Kd, Ts);
+
+// === Estructura de control ===
+struct MotorControl {
+    EncoderClass *encoder;
+    MotorClass *motor;
+    PIDClass *pid;
+    const char *name;
+    int index;   // índice para inputs/outputs
+};
+
+// === Tarea de control PID ===
+void control_motor_task(void *pvParameters)
+{
+    MotorControl *mc = (MotorControl *)pvParameters;
+    TickType_t last_wake_time = xTaskGetTickCount();
+
+    while (true)
+    {
+        // Setpoint desde MATLAB (input)
+        float setpoint = (float)inputs[mc->index];
+        float position = mc->encoder->read_degrees();
+
+        // Guardar posición actual en outputs → MATLAB
+        outputs[mc->index] = (int16_t)position;
+
+        // Calcular control PID
+        float control = mc->pid->compute(setpoint, position);
+
+        // Saturación de seguridad
+        if (control > 100.0f) control = 100.0f;
+        if (control < -100.0f) control = -100.0f;
+
+        mc->motor->setPWM(control);
+
+        // Log de depuración
+        // ESP_LOGI(mc->name, "Set: %.1f°  Pos: %.2f°  PWM: %.2f", setpoint, position, control);
+
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS((uint32_t)(Ts * 1000.0f)));
+    }
+}
+
+// === Configuración principal ===
+extern "C" void app_main(void)
+{
+    gpio_reset_pin(GPIO_NUM_4);
+    gpio_reset_pin(GPIO_NUM_14);
+
+    // Iniciar UART (comunicación con MATLAB)
+    start_uart_task(inputs, outputs);
+
+    // Inicializar motores
+    Motor1.MotorInitialize();
+    Motor2.MotorInitialize();
+    Motor3.MotorInitialize();
+    Motor4.MotorInitialize();
+
+    // Inicializar encoders
+    encoder1.begin();
+    encoder2.begin();
+    encoder3.begin();
+    encoder4.begin();
+
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    // Crear estructuras de control
+    static MotorControl mc1 = { &encoder1, &Motor1, &pid1, "MOTOR1", 0 };
+    static MotorControl mc2 = { &encoder2, &Motor2, &pid2, "MOTOR2", 1 };
+    static MotorControl mc3 = { &encoder3, &Motor3, &pid3, "MOTOR3", 2 };
+    static MotorControl mc4 = { &encoder4, &Motor4, &pid4, "MOTOR4", 3 };
+
+    // Crear tareas de control en core 1
+    xTaskCreatePinnedToCore(control_motor_task, "control_motor1", 4096, &mc1, 5, NULL, 1);
+    xTaskCreatePinnedToCore(control_motor_task, "control_motor2", 4096, &mc2, 5, NULL, 1);
+    xTaskCreatePinnedToCore(control_motor_task, "control_motor3", 4096, &mc3, 5, NULL, 1);
+    xTaskCreatePinnedToCore(control_motor_task, "control_motor4", 4096, &mc4, 5, NULL, 1);
+
+    ESP_LOGI("MAIN", "Control PID + UART iniciado correctamente.");
+}

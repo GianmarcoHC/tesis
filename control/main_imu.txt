@@ -1,0 +1,24 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "AccelClass.h"
+#include <math.h>
+#include "esp_log.h"
+
+#define RAD2DEG 57.295779513
+
+extern "C" void app_main() {
+    mpu6050_init();
+    imu_raw_t imu;
+
+    while (1) {
+        mpu6050_read(&imu);
+
+        // Cálculo de pitch y roll con acelerómetro:
+        float roll  = atan2(imu.ay, imu.az) * RAD2DEG;
+        float pitch = atan2(-imu.ax, sqrt(imu.ay*imu.ay + imu.az*imu.az)) * RAD2DEG;
+
+        ESP_LOGI("IMU", "Roll=%.2f Pitch=%.2f (deg)", roll, pitch);
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}

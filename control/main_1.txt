@@ -1,0 +1,507 @@
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/uart.h"
+#include "esp_system.h"
+#include "esp_random.h"
+
+#define UART1_TXD (19)
+#define UART1_RXD (18)
+
+#define UART2_TXD (17)
+#define UART2_RXD (16)
+
+#define UART1_PORT UART_NUM_1
+#define UART2_PORT UART_NUM_2
+
+#define BUF_SIZE (1024)
+#define TASK_MEMORY (4096)
+
+#define ROBOCLAW1_ADDRESS 0x80
+#define ROBOCLAW2_ADDRESS 0x81
+
+static const char *TAG = "UART_MANAGER";
+
+// Colas de eventos
+static QueueHandle_t uart1_queue;
+static QueueHandle_t uart2_queue;
+
+// Variables para encoders
+static int32_t encoder1 = 0;
+static int32_t encoder2 = 0;
+
+// Mutex para acceso a UARTs
+static SemaphoreHandle_t uart1_mutex;
+static SemaphoreHandle_t uart2_mutex;
+
+// ============================
+// Función de cálculo de CRC16
+// ============================
+static uint16_t crc16(const uint8_t *packet, int nBytes)
+{
+    uint16_t crc = 0;
+    for (int byte = 0; byte < nBytes; byte++)
+    {
+        crc = crc ^ ((uint16_t)packet[byte] << 8);
+        for (uint8_t bit = 0; bit < 8; bit++)
+        {
+            if (crc & 0x8000)
+            {
+                crc = (crc << 1) ^ 0x1021;
+            }
+            else
+            {
+                crc = crc << 1;
+            }
+        }
+    }
+    return crc;
+}
+
+static uint16_t crc16_update(uint16_t crc, const uint8_t *packet, int nBytes)
+{
+    for (int byte = 0; byte < nBytes; byte++)
+    {
+        crc = crc ^ ((uint16_t)packet[byte] << 8);
+        for (uint8_t bit = 0; bit < 8; bit++)
+        {
+            if (crc & 0x8000)
+            {
+                crc = (crc << 1) ^ 0x1021;
+            }
+            else
+            {
+                crc = crc << 1;
+            }
+        }
+    }
+    return crc;
+}
+
+// ============================
+// Leer encoder del Roboclaw
+// ============================
+static bool roboclaw_read_encoders(uart_port_t uart_num, uint8_t address,
+                                   int32_t *enc1, int32_t *enc2)
+{
+    xSemaphoreTake(uart1_mutex, portMAX_DELAY); // Tomar mutex antes de usar UART
+
+    uint8_t packet[4];
+    packet[0] = address;
+    packet[1] = 78; // Comando Read Encoder Counters
+
+    // Calcular CRC
+    uint16_t crc = crc16(packet, 2);
+    packet[2] = crc >> 8;
+    packet[3] = crc & 0xFF;
+
+    // Enviar paquete
+    int tx_bytes = uart_write_bytes(uart_num, (const char *)packet, sizeof(packet));
+
+    if (tx_bytes != sizeof(packet))
+    {
+        ESP_LOGW(TAG, "UART%d: no se enviaron todos los bytes", uart_num);
+        return false;
+    }
+
+    // Esperar respuesta: 4+4+2 = 10 bytes
+    uint8_t response[10];
+    int len = uart_read_bytes(uart_num, response, sizeof(response), pdMS_TO_TICKS(20));
+
+    xSemaphoreGive(uart1_mutex); // liberar mutex
+
+    if (len < 10)
+    {
+        ESP_LOGW(TAG, "UART%d: respuesta incompleta", uart_num);
+        return false;
+    }
+
+    // Verificar CRC en respuesta
+    uint16_t crc_resp = (response[8] << 8) | response[9];
+    // calcular CRC incluyendo address, cmd y los 8 bytes de datos
+    uint16_t crc_calc = 0;
+
+    uint8_t header[2] = {address, 78};
+
+    crc_calc = crc16_update(crc_calc, header, 2);   // address + cmd
+    crc_calc = crc16_update(crc_calc, response, 8); // datos encoders
+
+    if (crc_resp != crc_calc)
+    {
+        ESP_LOGE(TAG, "UART%d: CRC inválido (calc=0x%04X, resp=0x%04X)",
+                 uart_num, crc_calc, crc_resp);
+        return false;
+    }
+
+    // Reconstruir valores
+    *enc1 = (response[0] << 24) | (response[1] << 16) | (response[2] << 8) | response[3];
+    *enc2 = (response[4] << 24) | (response[5] << 16) | (response[6] << 8) | response[7];
+
+    return true;
+}
+
+// ============================
+// Leer velocidad filtrada (Cmd 18)
+// ============================
+static bool roboclaw_read_speed_m1(uart_port_t uart_num, uint8_t address, int32_t *speed, uint8_t *status)
+{
+    xSemaphoreTake(uart1_mutex, portMAX_DELAY);
+
+    uint8_t packet[4];
+    packet[0] = address;
+    packet[1] = 18; // Read Encoder Speed M1
+
+    // CRC sobre [address, cmd]
+    uint16_t crc = crc16(packet, 2);
+    packet[2] = crc >> 8;
+    packet[3] = crc & 0xFF;
+
+    uart_write_bytes(uart_num, (const char *)packet, sizeof(packet));
+
+    // Respuesta: [Speed(4), Status(1), CRC(2)] = 7 bytes
+    uint8_t response[7];
+    int len = uart_read_bytes(uart_num, response, sizeof(response), pdMS_TO_TICKS(20));
+
+    xSemaphoreGive(uart1_mutex);
+
+    if (len < 7)
+        return false;
+
+    // Validar CRC
+    uint16_t crc_resp = (response[5] << 8) | response[6];
+    uint16_t crc_calc = 0;
+    uint8_t header[2] = {address, 18};
+    crc_calc = crc16_update(crc_calc, header, 2);
+    crc_calc = crc16_update(crc_calc, response, 5);
+
+    if (crc_resp != crc_calc)
+    {
+        ESP_LOGE(TAG, "CRC inválido en Read Speed M1");
+        return false;
+    }
+
+    *speed = (response[0] << 24) | (response[1] << 16) | (response[2] << 8) | response[3];
+    *status = response[4]; // 0=fwd, 1=rev
+
+    return true;
+}
+
+// ============================
+// Leer velocidad cruda (Cmd 30)
+// ============================
+static bool roboclaw_read_raw_speed_m1(uart_port_t uart_num, uint8_t address, int32_t *speed, uint8_t *status)
+{
+    xSemaphoreTake(uart1_mutex, portMAX_DELAY);
+
+    uint8_t packet[4];
+    packet[0] = address;
+    packet[1] = 30; // Read Raw Speed M1
+
+    // CRC
+    uint16_t crc = crc16(packet, 2);
+    packet[2] = crc >> 8;
+    packet[3] = crc & 0xFF;
+
+    uart_write_bytes(uart_num, (const char *)packet, sizeof(packet));
+
+    // Respuesta: [Speed(4), Status(1), CRC(2)] = 7 bytes
+    uint8_t response[7];
+    int len = uart_read_bytes(uart_num, response, sizeof(response), pdMS_TO_TICKS(20));
+
+    xSemaphoreGive(uart1_mutex);
+
+    if (len < 7)
+        return false;
+
+    // Validar CRC
+    uint16_t crc_resp = (response[5] << 8) | response[6];
+    uint16_t crc_calc = 0;
+    uint8_t header[2] = {address, 30};
+    crc_calc = crc16_update(crc_calc, header, 2);
+    crc_calc = crc16_update(crc_calc, response, 5);
+
+    if (crc_resp != crc_calc)
+    {
+        ESP_LOGE(TAG, "CRC inválido en Raw Speed M1");
+        return false;
+    }
+
+    *speed = (response[0] << 24) | (response[1] << 16) | (response[2] << 8) | response[3];
+    *status = response[4];
+
+    return true;
+}
+
+// ============================
+// Enviar PWM a M1
+// ============================
+static bool roboclaw_drive_m1(uart_port_t uart_num, uint8_t address, uint8_t value)
+{
+    xSemaphoreTake(uart1_mutex, portMAX_DELAY); // Tomar mutex antes de usar UART
+
+    uint8_t packet[5];
+    packet[0] = address;
+    packet[1] = 6;     // Comando Drive M1
+    packet[2] = value; // 0 = full reverse, 64 = stop, 127 = full forward
+
+    // Calcular CRC (sobre [address, cmd, value])
+    uint16_t crc = crc16(packet, 3);
+    packet[3] = crc >> 8;
+    packet[4] = crc & 0xFF;
+
+    // Enviar paquete
+    uart_write_bytes(uart_num, (const char *)packet, sizeof(packet));
+
+    // Esperar ACK (1 byte, 0xFF)
+    uint8_t ack;
+    int len = uart_read_bytes(uart_num, &ack, 1, pdMS_TO_TICKS(20));
+
+    xSemaphoreGive(uart1_mutex); // liberar mutex
+
+    if (len < 1)
+    {
+        ESP_LOGW(TAG, "UART%d: No se recibió ACK de M1", uart_num);
+        return false;
+    }
+
+    if (ack != 0xFF)
+    {
+        ESP_LOGE(TAG, "UART%d: ACK inválido (0x%02X)", uart_num, ack);
+        return false;
+    }
+
+    return true;
+}
+
+// ============================
+// Drive M1/M2 con posición
+// ============================
+static bool roboclaw_drive_mixed_position(uart_port_t uart_num, uint8_t address,
+                                          int32_t m1_pos, int32_t m2_pos, uint8_t buffer)
+{
+    xSemaphoreTake(uart1_mutex, portMAX_DELAY); // Tomar mutex
+
+    uint8_t packet[1 + 1 + 4 + 4 + 1 + 2]; // Address + cmd + M1(4) + M2(4) + buffer + CRC(2)
+    int idx = 0;
+
+    packet[idx++] = address;
+    packet[idx++] = 121; // comando
+
+    // M1 Position (big endian)
+    packet[idx++] = (m1_pos >> 24) & 0xFF;
+    packet[idx++] = (m1_pos >> 16) & 0xFF;
+    packet[idx++] = (m1_pos >> 8) & 0xFF;
+    packet[idx++] = (m1_pos) & 0xFF;
+
+    // M2 Position (big endian)
+    packet[idx++] = (m2_pos >> 24) & 0xFF;
+    packet[idx++] = (m2_pos >> 16) & 0xFF;
+    packet[idx++] = (m2_pos >> 8) & 0xFF;
+    packet[idx++] = (m2_pos) & 0xFF;
+
+    // Buffer (0 = start now, 1 = queue command, etc.)
+    packet[idx++] = buffer;
+
+    // CRC sobre todo lo anterior
+    uint16_t crc = crc16(packet, idx);
+    packet[idx++] = (crc >> 8) & 0xFF;
+    packet[idx++] = crc & 0xFF;
+
+    // Enviar paquete
+    uart_write_bytes(uart_num, (const char *)packet, idx);
+
+    // Leer ACK
+    uint8_t ack;
+    int len = uart_read_bytes(uart_num, &ack, 1, pdMS_TO_TICKS(20));
+
+    xSemaphoreGive(uart1_mutex); // liberar mutex
+
+    if (len < 1)
+    {
+        ESP_LOGW(TAG, "UART%d: No se recibió ACK del cmd 121", uart_num);
+        return false;
+    }
+
+    if (ack != 0xFF)
+    {
+        ESP_LOGE(TAG, "UART%d: ACK inválido (0x%02X)", uart_num, ack);
+        return false;
+    }
+
+    return true;
+}
+
+// ============================
+// Drive M1/M2 con Speed y Position
+// ============================
+static bool roboclaw_drive_speed_position(uart_port_t uart_num, uint8_t address,
+                                          uint32_t speed_m1, int32_t pos_m1,
+                                          uint32_t speed_m2, int32_t pos_m2,
+                                          uint8_t buffer)
+{
+    xSemaphoreTake(uart1_mutex, portMAX_DELAY); // proteger UART
+
+    uint8_t packet[1 + 1 + 4 + 4 + 4 + 4 + 1 + 2];
+    int idx = 0;
+
+    packet[idx++] = address;
+    packet[idx++] = 124; // comando
+
+    // Speed M1 (big endian, unsigned)
+    packet[idx++] = (speed_m1 >> 24) & 0xFF;
+    packet[idx++] = (speed_m1 >> 16) & 0xFF;
+    packet[idx++] = (speed_m1 >> 8) & 0xFF;
+    packet[idx++] = (speed_m1) & 0xFF;
+
+    // Position M1 (big endian, signed)
+    packet[idx++] = (pos_m1 >> 24) & 0xFF;
+    packet[idx++] = (pos_m1 >> 16) & 0xFF;
+    packet[idx++] = (pos_m1 >> 8) & 0xFF;
+    packet[idx++] = (pos_m1) & 0xFF;
+
+    // Speed M2 (big endian, unsigned)
+    packet[idx++] = (speed_m2 >> 24) & 0xFF;
+    packet[idx++] = (speed_m2 >> 16) & 0xFF;
+    packet[idx++] = (speed_m2 >> 8) & 0xFF;
+    packet[idx++] = (speed_m2) & 0xFF;
+
+    // Position M2 (big endian, signed)
+    packet[idx++] = (pos_m2 >> 24) & 0xFF;
+    packet[idx++] = (pos_m2 >> 16) & 0xFF;
+    packet[idx++] = (pos_m2 >> 8) & 0xFF;
+    packet[idx++] = (pos_m2) & 0xFF;
+
+    // Buffer
+    packet[idx++] = buffer;
+
+    // CRC
+    uint16_t crc = crc16(packet, idx);
+    packet[idx++] = (crc >> 8) & 0xFF;
+    packet[idx++] = crc & 0xFF;
+
+    // Enviar
+    uart_write_bytes(uart_num, (const char *)packet, idx);
+
+    // Leer ACK
+    uint8_t ack;
+    int len = uart_read_bytes(uart_num, &ack, 1, pdMS_TO_TICKS(20));
+
+    xSemaphoreGive(uart1_mutex);
+
+    if (len < 1)
+    {
+        ESP_LOGW(TAG, "UART%d: No ACK en cmd 124", uart_num);
+        return false;
+    }
+    if (ack != 0xFF)
+    {
+        ESP_LOGE(TAG, "UART%d: ACK inválido (0x%02X)", uart_num, ack);
+        return false;
+    }
+    return true;
+}
+
+void task_uart1(void *pvParameters)
+{
+    int counter = 0;
+    int pwm_value = 64; // valor inicial = stop (neutro en Roboclaw)
+
+    roboclaw_drive_m1(UART1_PORT, ROBOCLAW1_ADDRESS, pwm_value);
+
+    while (1)
+    {
+        int32_t e1, e2;
+        int32_t v1_raw;
+        uint8_t st1_raw;
+
+        // === 1. Leer encoders ===
+        if (roboclaw_read_encoders(UART1_PORT, ROBOCLAW1_ADDRESS, &e1, &e2))
+        {
+            encoder1 = e1;
+            encoder2 = e2;
+        }
+
+        // === 2. Leer velocidad cruda ===
+        if (roboclaw_read_raw_speed_m1(UART1_PORT, ROBOCLAW1_ADDRESS, &v1_raw, &st1_raw))
+        {
+            // Obtener tiempo actual
+            TickType_t ticks = xTaskGetTickCount();
+            uint32_t tiempo_ms = ticks * portTICK_PERIOD_MS;
+
+            // ===  imprimir todo en una sola línea ===
+            /*
+            ESP_LOGI(TAG, "t=%lu ms | RawSpeed=%ld pps | PWM=%d",
+                    (unsigned long)tiempo_ms,
+                    (long)v1_raw,
+                    (pwm_value-64)*100/64);
+            */
+            printf("%lu,%ld,%d\n",
+                   (unsigned long)tiempo_ms,
+                   (long)v1_raw,
+                   (pwm_value-64)*100/64);
+        }
+
+        // === 3. Cada 300 iteraciones cambia el PWM ===
+        counter++;
+        if (counter >= 300)
+        {
+            counter = 0;
+
+            // Generar valor aleatorio entre 0 y 127
+            pwm_value = esp_random() % 128;
+
+            // Mandar PWM nuevo al motor
+            roboclaw_drive_m1(UART1_PORT, ROBOCLAW1_ADDRESS, pwm_value);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10)); // 10 ms → 100 Hz loop
+    }
+}
+
+void task_uart2(void *pvParameters)
+{
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(10)); // lee cada 50ms (20Hz)
+    }
+}
+
+void uart_manager_init(void)
+{
+    const uart_config_t uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_APB};
+
+    // Mutex
+    uart1_mutex = xSemaphoreCreateMutex();
+    uart2_mutex = xSemaphoreCreateMutex();
+
+    // UART1
+    uart_param_config(UART1_PORT, &uart_config);
+    uart_set_pin(UART1_PORT, UART1_TXD, UART1_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART1_PORT, BUF_SIZE, BUF_SIZE, 5, &uart1_queue, 0);
+
+    // UART2
+    uart_param_config(UART2_PORT, &uart_config);
+    uart_set_pin(UART2_PORT, UART2_TXD, UART2_RXD, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(UART2_PORT, BUF_SIZE, BUF_SIZE, 5, &uart2_queue, 0);
+
+    // Crear tasks para manejar recepción
+    xTaskCreate(task_uart1, "uart1_task", TASK_MEMORY, NULL, 5, NULL);
+    xTaskCreate(task_uart2, "uart2_task", TASK_MEMORY, NULL, 5, NULL);
+
+    ESP_LOGI(TAG, "UART1 y UART2 inicializados");
+}
+
+// ============================
+// MAIN
+// ============================
+
+void app_main(void)
+{
+    uart_manager_init();
+}

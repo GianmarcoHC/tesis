@@ -1,0 +1,184 @@
+#include <stdio.h>
+#include <string.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/Task.h"
+
+#include "esp_now.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_mac.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_log.h"
+
+// ==== CONTROL (tus librerías) ====
+#include "EncoderClass.h"
+#include "MotorClass.h"
+#include "PIDClass.h"
+#include "uart_manager.h"
+
+// ===============================
+// ESP-NOW PACKET STRUCT
+// ===============================
+typedef struct __attribute__((packed)) {
+    int16_t roll_x100;   // roll * 100
+    int16_t pitch_x100;  // pitch * 100
+} imu_packet_t;
+
+static const char *TAG = "CONTROL_NODE";
+
+// ===============================
+// UART I/O
+// ===============================
+static int16_t inputs[4];   // MATLAB → ESP32
+static int16_t outputs[4];  // ESP32 → MATLAB
+
+// ===============================
+// CONTROL DEFINITIONS
+// ===============================
+const float Ts = 0.02f;
+static float pos_ref[4] = {0,0,0,0};
+
+const float Kp = 1.0f;
+const float Ki = 0.0f;
+const float Kd = 0.0f;
+
+// Encoders
+EncoderClass encoder1(GPIO_NUM_15, GPIO_NUM_2, PCNT_UNIT_0);
+EncoderClass encoder2(GPIO_NUM_35, GPIO_NUM_34, PCNT_UNIT_1);
+EncoderClass encoder3(GPIO_NUM_21, GPIO_NUM_22, PCNT_UNIT_2);
+EncoderClass encoder4(GPIO_NUM_18, GPIO_NUM_19, PCNT_UNIT_3);
+
+// Motores
+MotorClass Motor1(GPIO_NUM_32, GPIO_NUM_33, MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A);
+MotorClass Motor2(GPIO_NUM_25, GPIO_NUM_26, MCPWM_UNIT_0, MCPWM_TIMER_1, MCPWM_OPR_A);
+MotorClass Motor3(GPIO_NUM_27, GPIO_NUM_14, MCPWM_UNIT_1, MCPWM_TIMER_0, MCPWM_OPR_A);
+MotorClass Motor4(GPIO_NUM_5,  GPIO_NUM_4,  MCPWM_UNIT_1, MCPWM_TIMER_1, MCPWM_OPR_A);
+
+// PID
+PIDClass pid1(Kp, Ki, Kd, Ts);
+PIDClass pid2(Kp, Ki, Kd, Ts);
+PIDClass pid3(Kp, Ki, Kd, Ts);
+PIDClass pid4(Kp, Ki, Kd, Ts);
+
+// ===============================
+// ESTRUCTURA PARA EL CONTROL
+// ===============================
+struct MotorControl {
+    EncoderClass *encoder;
+    MotorClass *motor;
+    PIDClass *pid;
+    int index;
+    const char *name;
+};
+
+// ===============================
+// ESP-NOW: CALLBACK DE RECEPCIÓN
+// ===============================
+void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+    if (len == sizeof(imu_packet_t)) {
+        const imu_packet_t *pkt = (const imu_packet_t*) data;
+
+        outputs[0] = pkt->roll_x100;   // roll *100
+        outputs[1] = pkt->pitch_x100;  // pitch*100
+        outputs[2] = 0;
+        outputs[3] = 0;
+
+        /*
+        ESP_LOGI(TAG,
+                 "IMU RX: roll=%.2f  pitch=%.2f",
+                 pkt->roll_x100 / 100.0f,
+                 pkt->pitch_x100 / 100.0f);
+        */
+    }
+}
+
+// ===============================
+// CONTROL DE MOTORES
+// ===============================
+void control_motor_task(void *pv)
+{
+    MotorControl *mc = (MotorControl*) pv;
+    TickType_t last = xTaskGetTickCount();
+
+    while (true)
+    {
+        float vel_cmd = (float)inputs[mc->index];
+        pos_ref[mc->index] += vel_cmd * Ts;
+
+        float setpoint = pos_ref[mc->index];
+        float position = mc->encoder->read_degrees();
+
+        // (SE QUITÓ) outputs[mc->index] = position;
+
+        float control = mc->pid->compute(setpoint, position);
+
+        if (control > 100) control = 100;
+        if (control < -100) control = -100;
+
+        mc->motor->setPWM(control);
+
+        vTaskDelayUntil(&last, pdMS_TO_TICKS((uint32_t)(Ts * 1000)));
+    }
+}
+
+// ===============================
+// WI-FI + ESP-NOW INIT
+// ===============================
+static void wifi_init_espnow()
+{
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_start();
+
+    esp_now_init();
+    esp_now_register_recv_cb(espnow_recv_cb);
+
+    ESP_LOGI(TAG, "ESP-NOW ready");
+}
+
+// ===============================
+// MAIN APP
+// ===============================
+extern "C" void app_main(void)
+{
+    wifi_init_espnow();
+
+    // UART MATLAB
+    start_uart_task(inputs, outputs);
+
+    // Motores
+    Motor1.MotorInitialize();
+    Motor2.MotorInitialize();
+    Motor3.MotorInitialize();
+    Motor4.MotorInitialize();
+
+    // Encoders
+    encoder1.begin();
+    encoder2.begin();
+    encoder3.begin();
+    encoder4.begin();
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    static MotorControl mc1 = { &encoder1, &Motor1, &pid1, 0, "M1" };
+    static MotorControl mc2 = { &encoder2, &Motor2, &pid2, 1, "M2" };
+    static MotorControl mc3 = { &encoder3, &Motor3, &pid3, 2, "M3" };
+    static MotorControl mc4 = { &encoder4, &Motor4, &pid4, 3, "M4" };
+
+    // PID tasks
+    xTaskCreatePinnedToCore(control_motor_task, "ctrl1", 4096, &mc1, 5, NULL, 1);
+    xTaskCreatePinnedToCore(control_motor_task, "ctrl2", 4096, &mc2, 5, NULL, 1);
+    xTaskCreatePinnedToCore(control_motor_task, "ctrl3", 4096, &mc3, 5, NULL, 1);
+    xTaskCreatePinnedToCore(control_motor_task, "ctrl4", 4096, &mc4, 5, NULL, 1);
+
+    ESP_LOGI(TAG, "CONTROL + ESP-NOW + UART running");
+}

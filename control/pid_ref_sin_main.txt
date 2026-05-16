@@ -1,0 +1,133 @@
+#include <stdio.h>
+#include "EncoderClass.h"
+#include "MotorClass.h"
+#include "PIDClass.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+
+#include <math.h>
+
+// === Parámetros generales ===
+static const char *TAG = "CONTROL";
+const float Ts = 0.02f;             // periodo de muestreo (s)
+float setpoint_global = -90;  // posición deseada (grados)
+bool setpoint_direction = true;     // true: hacia +180, false: hacia -180
+
+// === PID (idéntico para todos los motores) ===
+/*
+const float Kp = 9.9518f;
+const float Ki = 0.0031f;
+const float Kd = 0.4645f;
+*/
+const float Kp = 1.00f;
+const float Ki = 0.00f;
+const float Kd = 0.00f;
+
+// === Objetos globales ===
+// Encoders
+EncoderClass encoder1(GPIO_NUM_15, GPIO_NUM_2, PCNT_UNIT_0);
+EncoderClass encoder2(GPIO_NUM_35, GPIO_NUM_34, PCNT_UNIT_1);
+EncoderClass encoder3(GPIO_NUM_21, GPIO_NUM_22, PCNT_UNIT_2);
+EncoderClass encoder4(GPIO_NUM_18,  GPIO_NUM_19,  PCNT_UNIT_3);
+
+// Motores
+MotorClass Motor1(GPIO_NUM_32, GPIO_NUM_33, MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM_OPR_A);
+MotorClass Motor2(GPIO_NUM_25, GPIO_NUM_26, MCPWM_UNIT_0, MCPWM_TIMER_1, MCPWM_OPR_A);
+MotorClass Motor3(GPIO_NUM_27, GPIO_NUM_14, MCPWM_UNIT_1, MCPWM_TIMER_0, MCPWM_OPR_A);
+MotorClass Motor4(GPIO_NUM_5,  GPIO_NUM_4,  MCPWM_UNIT_1, MCPWM_TIMER_1, MCPWM_OPR_A);
+
+// PID
+PIDClass pid1(Kp, Ki, Kd, Ts);
+PIDClass pid2(Kp, Ki, Kd, Ts);
+PIDClass pid3(Kp, Ki, Kd, Ts);
+PIDClass pid4(Kp, Ki, Kd, Ts);
+
+// === Estructura de control (para pasar a la tarea) ===
+struct MotorControl {
+    EncoderClass *encoder;
+    MotorClass *motor;
+    PIDClass *pid;
+    const char *name;
+};
+
+// === Tarea que genera un setpoint sinusoidal ===
+void update_setpoint_task(void *pvParameters)
+{
+    const float amplitude = 130.0f;   // amplitud en grados
+    const float frequency = 1.0f / 4;    // frecuencia en Hz (0.05 Hz = 1 ciclo cada 20 segundos)
+    const float Ts_local = 0.02f;     // periodo de muestreo (s)
+    float time = 0.0f;
+
+    while (true)
+    {
+        // Genera una onda sinusoidal entre -amplitude y +amplitude
+        setpoint_global = amplitude * sinf(2.0f * M_PI * frequency * time);
+
+        ESP_LOGI("SETPOINT", "t=%.2f s  setpoint=%.2f°", time, setpoint_global);
+
+        time += Ts_local;
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)(Ts_local * 1000.0f)));
+    }
+}
+
+
+// === Tarea de control PID ===
+void control_motor_task(void *pvParameters)
+{
+    MotorControl *mc = (MotorControl *)pvParameters;
+    TickType_t last_wake_time = xTaskGetTickCount();
+
+    while (true)
+    {
+        float position = mc->encoder->read_degrees();
+        float control = mc->pid->compute(setpoint_global, position);
+
+        // Saturación del control (por seguridad)
+        if (control > 100.0f) control = 100.0f;
+        if (control < -100.0f) control = -100.0f;
+
+        mc->motor->setPWM(control);
+
+        ESP_LOGI(mc->name, "Pos: %.2f°  -> PWM: %.2f", position, control);
+
+        vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS((uint32_t)(Ts * 1000.0f)));
+    }
+}
+
+// === Configuración principal ===
+extern "C" void app_main(void)
+{
+    gpio_reset_pin(GPIO_NUM_14);
+
+    // Inicializar motores
+    Motor1.MotorInitialize();
+    Motor2.MotorInitialize();
+    Motor3.MotorInitialize();
+    Motor4.MotorInitialize();
+
+    // Inicializar encoders
+    encoder1.begin();
+    encoder2.begin();
+    encoder3.begin();
+    encoder4.begin();
+    
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    // Crear estructuras de control
+    static MotorControl mc1 = { &encoder1, &Motor1, &pid1, "MOTOR1" };
+    static MotorControl mc2 = { &encoder2, &Motor2, &pid2, "MOTOR2" };
+    static MotorControl mc3 = { &encoder3, &Motor3, &pid3, "MOTOR3" };
+    static MotorControl mc4 = { &encoder4, &Motor4, &pid4, "MOTOR4" };
+
+    // Crear tareas de control (una por motor)
+    xTaskCreate(control_motor_task, "control_motor1", 4096, &mc1, 5, NULL);
+    xTaskCreate(control_motor_task, "control_motor2", 4096, &mc2, 5, NULL);
+    xTaskCreate(control_motor_task, "control_motor3", 4096, &mc3, 5, NULL);
+    xTaskCreate(control_motor_task, "control_motor4", 4096, &mc4, 5, NULL);
+
+    ESP_LOGI(TAG, "Tareas de control iniciadas.");
+
+    xTaskCreate(update_setpoint_task, "update_setpoint", 2048, NULL, 3, NULL);
+
+}
