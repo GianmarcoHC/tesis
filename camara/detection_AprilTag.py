@@ -1,26 +1,30 @@
-
 # apriltag_pose_logger.py
 # Requisitos: pip install opencv-python numpy pupil-apriltags
 
-import cv2 as cv, numpy as np, os, csv, time
+import cv2 as cv, numpy as np, os, csv, time, socket, struct
 from pupil_apriltags import Detector # es el detector robusto de los AprilTags.
 from math import atan2, asin, degrees
 
-# ====== CONFIGURA AQUÍ ======
-CAM_INDEX   = 1          # 0 o 1 según tu sistema
-RESOLUTION  = (1920,1080) # (ancho, alto)
+# ===== UDP CONFIG =====
+UDP_IP = "127.0.0.1"
+UDP_PORT = 5005
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# ====== CONFIGURACIÓN INCIAL ======
+CAM_INDEX   = 0          # 0 o 1 según el sistema
+RESOLUTION  = (1920,1080) # (ancho, alto)(1920,1080)Full HD, (1280,720)HD
 FPS         = 60
-TAG_SIZE_M  = 0.2  # lado físico del tag (m). Medir cunado se ponga sobre la plataforma. Ahora se esta probando con una hoja impresa grande
+TAG_SIZE_M  = 0.067  # 6.7cm lado físico del tag (m). Medir cunado se ponga sobre la plataforma.
 CSV_PATH    = "pose_log.csv" # aquí registramos los datos
 TAG_FAMILY  = "tag36h11" # diccionario del tag que usaremos
 
 # ===========================
 # --- Offset opcional entre el centro del Tag y el centro del Efector (marco del Tag) ---
 # Si el tag está perfectamente centrado/pegado alineado al efector, deja la identidad.
-USE_OFFSET  = False # Se cambia  TRUE si no està centrado
+USE_OFFSET  = True # Se cambia  TRUE si no està centrado
 t_te = np.array([0.00, 0.00, 0.00])   # traslación Tag->Efector (m)
 # Rotación Tag->Efector (en grados, orden ZYX). Ej.: girar 90° sobre Z => [90,0,0]
-eul_te_deg = [0.0, 0.0, 0.0]
+eul_te_deg = [0.0, 0.0, 180.0]
 # ===========================
 
 def eul_zyx_to_rotm(eul_deg): # pasa de Euler ZYX (yaw–pitch–roll) a matriz de rotación. La usamos para construir R_te (rotación fija Tag-Efector)
@@ -33,7 +37,7 @@ def eul_zyx_to_rotm(eul_deg): # pasa de Euler ZYX (yaw–pitch–roll) a matriz 
     Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]])
     return Rz @ Ry @ Rx
 
-def rotm_to_eul_zyx(R): # conpar converitr la matriz de rotación a ángulos roll, pitch, yaw (orden ZYX, en grados)
+def rotm_to_eul_zyx(R): # para converitr la matriz de rotación a ángulos roll, pitch, yaw (orden ZYX, en grados)
     sy = -R[2,0]
     sy = max(-1.0, min(1.0, sy))  # clamp por seguridad numérica
     yaw = atan2(R[1,0], R[0,0])
@@ -43,8 +47,8 @@ def rotm_to_eul_zyx(R): # conpar converitr la matriz de rotación a ángulos rol
 
 R_te = eul_zyx_to_rotm(eul_te_deg)
 
-# Carga calibración si existe
-K = None; dist = None # M y dist se cmabia por K si se usa los motros parametros_1
+# Carga calibración
+K = None; dist = None # M y dist se cmabia por K si se usa los otros parametros_1 (K y dist ---- M y coefs_dist)
 if os.path.exists("camera_params_2.npz"): # ver cuál se usa
     params = np.load("camera_params_2.npz", allow_pickle=True)
     K = params["M"]; dist = params["coefs_dist"]
@@ -62,6 +66,7 @@ cap = cv.VideoCapture(CAM_INDEX, cv.CAP_DSHOW)
 cap.set(cv.CAP_PROP_FRAME_WIDTH,  RESOLUTION[0])
 cap.set(cv.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
 cap.set(cv.CAP_PROP_FPS, FPS)
+
 
 
 # Guardar parámetros en un .CSV para posterior análisis
@@ -112,34 +117,75 @@ while True:
 
         roll, pitch, yaw = rotm_to_eul_zyx(R_tc)
 
-        # Proyección de ejes (visual)
-        axis = np.float32([[0,0,0],
-                           [TAG_SIZE_M*0.4,0,0],
-                           [0,TAG_SIZE_M*0.4,0],
-                           [0,0,TAG_SIZE_M*0.4]])
-        rvec, _ = cv.Rodrigues(R_tc)
-        imgpts, _ = cv.projectPoints(axis, rvec, t_tc,
-                                     np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], dtype=float),
-                                     dist0)
-        p0, px, py, pz = [tuple(np.int32(p.ravel())) for p in imgpts]
-        cv.line(out, p0, px, (0,0,255), 3)
-        cv.line(out, p0, py, (0,255,0), 3)
-        cv.line(out, p0, pz, (255,0,0), 3)
-
         # --- Pose del EFECTOR (si hay offset Tag->Efector)
         if USE_OFFSET:
             R_ec = R_tc @ R_te          # R_ec: Efector respecto Cámara
             t_ec = R_tc @ t_te + t_tc   # t_ec: idem traslación
             rollE, pitchE, yawE = rotm_to_eul_zyx(R_ec)
             xe, ye, ze = t_ec
+
+            # Para visualización
+            R_vis = R_ec
+            t_vis = t_ec
+
         else:
-            R_ec = R_tc; rollE, pitchE, yawE = roll, pitch, yaw
+            R_ec = R_tc
+            t_ec = t_tc
+            rollE, pitchE, yawE = roll, pitch, yaw
             xe, ye, ze = t_tc
 
+            # Para visualización
+            R_vis = R_tc
+            t_vis = t_tc
+
+        # =============================
+        # ====== ENVÍO UDP ============
+        # =============================
+        # Convertimos:
+        #   metros → mm
+        #   grados → miligrados
+        xe_i = int(xe * 1000)
+        ye_i = int((-ye) * 1000)
+        ze_i = int((0.495 - ze + 0.033) * 1000)
+        rollE_i  = int((rollE + 180 if rollE < 0 else rollE - 180)  * 10)
+        pitchE_i = int((-pitchE) * 10)
+        yawE_i   = int((-yawE)   * 10)
+
+        # Empaquetado en 6 enteros int16
+        msg = struct.pack("<6h",
+                          xe_i, ye_i, ze_i,
+                          rollE_i, pitchE_i, yawE_i)
+
+        sock.sendto(msg, (UDP_IP, UDP_PORT))
+        # =============================
+        # Valores para visualizacion:
+        xe_viz = float(xe_i / 1000)
+        ye_viz = float(ye_i / 1000)
+        ze_viz = float(ze_i / 1000)
+        rollE_viz  = float(rollE_i / 10)
+        pitchE_viz = float(pitchE_i / 10)
+        yawE_viz   = float(yawE_i  / 10)
+
+        # Proyección de ejes (visual)
+        axis = np.float32([[0,0,0],
+                           [TAG_SIZE_M*0.4,0,0],
+                           [0,TAG_SIZE_M*0.4,0],
+                           [0,0,TAG_SIZE_M*0.4]])
+
+        rvec, _ = cv.Rodrigues(R_vis)
+        imgpts, _ = cv.projectPoints(axis, rvec, t_vis,
+                                    np.array([[fx,0,cx],[0,fy,cy],[0,0,1]], dtype=float),
+                                    dist0)
+
+        p0, px, py, pz = [tuple(np.int32(p.ravel())) for p in imgpts]
+        cv.line(out, p0, px, (0,0,255), 3)
+        cv.line(out, p0, py, (0,255,0), 3)
+        cv.line(out, p0, pz, (255,0,0), 3)
+
         # Superposición de texto
-        cv.putText(out, f"x={t_tc[0]:+.3f} y={t_tc[1]:+.3f} z={t_tc[2]:+.3f} m",
+        cv.putText(out, f"x={xe_viz:+.3f} y={ye_viz:+.3f} z={ze_viz:+.3f} m",
                    (20,30), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-        cv.putText(out, f"roll={roll:+.1f} pitch={pitch:+.1f} yaw={yaw:+.1f} deg",
+        cv.putText(out, f"roll={rollE_viz:+.1f} pitch={pitchE_viz:+.1f} yaw={yawE_viz:+.1f} deg",
                    (20,55), cv.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
 
         # Log CSV (ambas poses: Tag y Efector)
@@ -148,6 +194,10 @@ while True:
                          f"{roll:.3f}", f"{pitch:.3f}", f"{yaw:.3f}",
                          f"{xe:.6f}", f"{ye:.6f}", f"{ze:.6f}",
                          f"{rollE:.3f}", f"{pitchE:.3f}", f"{yawE:.3f}"])
+
+    cv.namedWindow("AprilTag Pose Logger", cv.WINDOW_NORMAL)
+    cv.resizeWindow("AprilTag Pose Logger", 960, 540)
+
 
     cv.imshow("AprilTag Pose Logger", out)
     k = cv.waitKey(1) & 0xFF
